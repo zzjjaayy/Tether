@@ -22,6 +22,12 @@ public final class UDPDiscoveryService: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.subhashh.tether.udp", qos: .userInitiated)
     private var broadcastTimer: DispatchSourceTimer?
     private var isRunning = false
+    private var listenPort = UDPDiscoveryService.defaultPort
+    /// Set when a send fails because the socket's send buffer is full. A content
+    /// filter (e.g. an endpoint security network extension) can keep datagrams it
+    /// failed to reinject charged to the socket indefinitely, so the socket is
+    /// replaced before the next announcement.
+    private var sendBufferFull = false
     private var knownTargetIPs = Set<String>()
     /// The user's phones on their Tailscale network, refreshed by TetherService.
     private var tailscaleTargetIPs = Set<String>()
@@ -100,6 +106,7 @@ public final class UDPDiscoveryService: @unchecked Sendable {
     public func start(listenPort: UInt16 = UDPDiscoveryService.defaultPort) {
         guard !isRunning else { return }
         isRunning = true
+        self.listenPort = listenPort
 
         setupSocket(port: listenPort)
         startBroadcasting()
@@ -121,12 +128,17 @@ public final class UDPDiscoveryService: @unchecked Sendable {
         }
     }
 
-    private func setupSocket(port: UInt16) {
+    @discardableResult
+    private func setupSocket(port: UInt16) -> Bool {
         let fd = socket(AF_INET, SOCK_DGRAM, 0)
         guard fd >= 0 else {
             TetherLog("[UDPDiscovery] Failed to create UDP socket: \(errno)")
-            return
+            return false
         }
+
+        // Discovery shares one serial queue with receiving, so a send must never block it.
+        let fileFlags = fcntl(fd, F_GETFL)
+        _ = fcntl(fd, F_SETFL, fileFlags | O_NONBLOCK)
 
         var reuse: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
@@ -149,7 +161,7 @@ public final class UDPDiscoveryService: @unchecked Sendable {
         if bindResult < 0 {
             TetherLog("[UDPDiscovery] Failed to bind UDP socket on port \(port): \(errno)")
             close(fd)
-            return
+            return false
         }
 
         self.socketFD = fd
@@ -164,6 +176,18 @@ public final class UDPDiscoveryService: @unchecked Sendable {
         source.resume()
         self.readSource = source
         TetherLog("[UDPDiscovery] Listening for UDP discovery broadcasts on port \(port)")
+        return true
+    }
+
+    /// Replaces a socket whose send buffer is stuck. The new socket is opened before
+    /// the old read source is cancelled, so the old descriptor's number can't be
+    /// reused by the new socket and then closed by the old cancel handler.
+    private func rebuildSocket() {
+        let oldSource = readSource
+        guard setupSocket(port: listenPort) else { return }
+        oldSource?.cancel()
+        sendBufferFull = false
+        TetherLog("[UDPDiscovery] Replaced UDP socket after its send buffer filled up")
     }
 
     private func readDatagram() {
@@ -288,7 +312,16 @@ public final class UDPDiscoveryService: @unchecked Sendable {
             }
             if sin.sin_family == sa_family_t(AF_INET) {
                 let ipStr = String(cString: inet_ntoa(sin.sin_addr))
-                if !ipStr.hasSuffix(".255") && !ipStr.hasSuffix(".0") && !ipStr.hasPrefix("127.") && !ipStr.hasPrefix("224.") {
+                // Incomplete entries (nothing answered ARP) have no link-layer address.
+                // Sending to them only fails with EHOSTUNREACH, and a content filter
+                // can keep those failed datagrams charged to the socket.
+                let sinLen = max(Int(sin.sin_len), MemoryLayout<UInt32>.size)
+                let sdlOffset = sinOffset + ((sinLen + 3) & ~3)
+                let resolved = sdlOffset + 7 <= offset + rtmMsgLen
+                    && buffer[sdlOffset + 1] == UInt8(AF_LINK)
+                    && buffer[sdlOffset + 6] > 0
+                let isMulticast = UInt32(bigEndian: sin.sin_addr.s_addr) >> 28 == 0xE
+                if resolved && !isMulticast && !ipStr.hasSuffix(".255") && !ipStr.hasSuffix(".0") && !ipStr.hasPrefix("127.") {
                     if !ips.contains(ipStr) {
                         ips.append(ipStr)
                     }
@@ -370,6 +403,9 @@ public final class UDPDiscoveryService: @unchecked Sendable {
 
     private func sendBroadcastData(_ data: Data, sweepSubnet: Bool = false, routine: Bool = false) {
         guard socketFD >= 0 else { return }
+        if sendBufferFull {
+            rebuildSocket()
+        }
         let connected = delegate?.connectedHosts() ?? []
         // A broadcast reaches connected phones too, so a routine announcement
         // only broadcasts while nothing is connected; otherwise it unicasts to
@@ -417,7 +453,7 @@ public final class UDPDiscoveryService: @unchecked Sendable {
     }
 
     private func sendDatagram(data: Data, toIP ip: String) {
-        guard socketFD >= 0 else { return }
+        guard socketFD >= 0, !sendBufferFull else { return }
         var targetAddr = sockaddr_in()
         targetAddr.sin_family = sa_family_t(AF_INET)
         targetAddr.sin_port = in_port_t(UDPDiscoveryService.defaultPort).bigEndian
@@ -433,8 +469,13 @@ public final class UDPDiscoveryService: @unchecked Sendable {
                     sendto(self.socketFD, baseAddress, data.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
                 }
             }
-            if sent < 0 && errno != EHOSTUNREACH && errno != ENETUNREACH && errno != EHOSTDOWN {
-                TetherLog("[UDPDiscovery] Failed to send discovery to \(ip): errno \(errno)")
+            guard sent < 0 else { return }
+            let err = errno
+            if err == EAGAIN || err == ENOBUFS {
+                self.sendBufferFull = true
+                TetherLog("[UDPDiscovery] Send buffer full at \(ip) (errno \(err)); skipping the rest of this round")
+            } else if err != EHOSTUNREACH && err != ENETUNREACH && err != EHOSTDOWN {
+                TetherLog("[UDPDiscovery] Failed to send discovery to \(ip): errno \(err)")
             }
         }
     }
