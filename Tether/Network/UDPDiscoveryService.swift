@@ -112,8 +112,7 @@ public final class UDPDiscoveryService: @unchecked Sendable {
         broadcastTimer?.cancel()
         broadcastTimer = nil
 
-        // The read source's cancel handler closes the descriptor. Closing it here
-        // as well could close a different socket that has reused the number.
+        // The cancel handler closes the fd; closing it here too could hit a reused number.
         readSource?.cancel()
         readSource = nil
         socketFD = -1
@@ -126,7 +125,8 @@ public final class UDPDiscoveryService: @unchecked Sendable {
             return
         }
 
-        // Discovery shares one serial queue with receiving, so a send must never block it.
+        // Behind a socket content filter a blocking send can sleep forever, and this
+        // queue also receives, so sends must never block.
         let fileFlags = fcntl(fd, F_GETFL)
         _ = fcntl(fd, F_SETFL, fileFlags | O_NONBLOCK)
 
@@ -237,7 +237,6 @@ public final class UDPDiscoveryService: @unchecked Sendable {
 
     private var lastDirectPresenceSent: [String: Date] = [:]
 
-    /// Callable from any thread; the throttle is only touched on `queue`.
     public func sendDirectPresence(to host: String, tcpPort: Int? = nil) {
         let packet = DeviceIdentity.shared.toDeviceInfo(tcpPort: tcpPort).toUdpDiscoveryPacket()
         guard let data = try? packet.serialize() else { return }
@@ -290,9 +289,7 @@ public final class UDPDiscoveryService: @unchecked Sendable {
             }
             if sin.sin_family == sa_family_t(AF_INET) {
                 let ipStr = String(cString: inet_ntoa(sin.sin_addr))
-                // Incomplete entries (nothing answered ARP) have no link-layer address.
-                // Sending to them can only fail, and behind a socket content filter
-                // those failures can stall the socket.
+                // Skip incomplete entries: nothing answered ARP there.
                 let sinLen = max(Int(sin.sin_len), MemoryLayout<UInt32>.size)
                 let sdlOffset = sinOffset + ((sinLen + 3) & ~3)
                 let resolved = sdlOffset + 7 <= offset + rtmMsgLen
@@ -346,9 +343,7 @@ public final class UDPDiscoveryService: @unchecked Sendable {
         guard socketFD >= 0 else { return }
         let connected = delegate?.connectedHosts() ?? []
 
-        // 1. Known past & manual target IPs, and phones on the user's tailnet.
-        // These are the likeliest phones, so they go first in case the round
-        // is cut short.
+        // 1. Known past & manual target IPs and tailnet phones, first in case the round is cut short.
         var targets = Array(knownTargetIPs.union(tailscaleTargetIPs))
 
         // 2. A broadcast reaches connected phones too, so a routine announcement
@@ -379,9 +374,7 @@ public final class UDPDiscoveryService: @unchecked Sendable {
         }
     }
 
-    /// Returns false when the socket's send buffer is full, so a round can stop
-    /// early. The socket is non-blocking: behind a socket content filter, sends
-    /// wait for the filter's verdict, and a blocking send could sleep forever.
+    /// Returns false when the send buffer is full, so a round can stop early.
     @discardableResult
     private func sendDatagram(data: Data, toIP ip: String) -> Bool {
         guard socketFD >= 0 else { return false }
