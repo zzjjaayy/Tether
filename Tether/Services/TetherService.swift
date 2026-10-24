@@ -214,7 +214,7 @@ public final class TetherService: ObservableObject, UDPDiscoveryDelegate, MDNSDi
                       !pendingConnections.keys.contains(where: { $0.hasPrefix("in_\(host):") }) else { return }
                 udpDiscovery.sendDirectPresence(to: host, throttled: false)
             }
-            TetherLog("[TetherService] Gave up reaching \(deviceId) at \(host) after 45 s")
+            TetherLog("[TetherService] Sent last attempt to \(deviceId) at \(host) at 45 s")
         }
     }
 
