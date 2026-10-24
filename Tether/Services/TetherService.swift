@@ -460,13 +460,13 @@ public final class TetherService: ObservableObject, UDPDiscoveryDelegate, TCPLis
         remoteVolumePlugin.requestSinks(connection: conn)
     }
 
-    /// `thorough` sweeps the whole subnet, as the "Look for Devices" buttons do.
-    /// Otherwise it's the routine broadcast, which leaves connected phones
-    /// alone: KDE Connect on Android answers any announcement by opening a new
-    /// connection and dropping its current one.
+    /// `thorough` announces to every candidate, connected phones included, as the
+    /// "Look for Devices" buttons do. Otherwise it's the routine broadcast, which
+    /// leaves connected phones alone: KDE Connect on Android answers any
+    /// announcement by opening a new connection and dropping its current one.
     public func refreshDiscovery(thorough: Bool = true) {
         if thorough {
-            udpDiscovery.broadcastPresence(sweepSubnet: true)
+            udpDiscovery.broadcastPresence()
         } else {
             udpDiscovery.broadcastPresence(routine: true)
         }
@@ -485,7 +485,7 @@ public final class TetherService: ObservableObject, UDPDiscoveryDelegate, TCPLis
         TetherLog("[TetherService] Adding manual peer \(host) (\(ip))")
         udpDiscovery.addKnownTarget(ip: ip)
         udpDiscovery.sendDirectPresence(to: ip)
-        udpDiscovery.broadcastPresence(sweepSubnet: false)
+        udpDiscovery.broadcastPresence()
         return true
     }
 
