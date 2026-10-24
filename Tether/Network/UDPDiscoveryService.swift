@@ -34,6 +34,8 @@ public final class UDPDiscoveryService: @unchecked Sendable {
     private static let hostOwnersKey = "tether_host_owners"
     private var lastLoggedBroadcastTargets = Set<String>()
     private var hasLoggedOutboundPacket = false
+    /// Bumped by each new sweep, so an older one still pausing stops.
+    private var sweepGeneration = 0
 
     public init() {
         hostOwners = UserDefaults.standard.dictionary(forKey: Self.hostOwnersKey) as? [String: String] ?? [:]
@@ -219,8 +221,9 @@ public final class UDPDiscoveryService: @unchecked Sendable {
     /// Announces this Mac. `routine` is the periodic background announcement:
     /// it skips devices that are already connected, because KDE Connect on
     /// Android answers every announcement by opening a fresh connection, which
-    /// would otherwise churn a healthy one every cycle.
-    public func broadcastPresence(tcpPort: Int? = nil, routine: Bool = false) {
+    /// would otherwise churn a healthy one every cycle. `sweepSubnet` also sends
+    /// to every address on the local subnets; it's only for explicit requests.
+    public func broadcastPresence(tcpPort: Int? = nil, routine: Bool = false, sweepSubnet: Bool = false) {
         let packet = DeviceIdentity.shared.toDeviceInfo(tcpPort: tcpPort).toUdpDiscoveryPacket()
         guard let data = try? packet.serialize() else { return }
 
@@ -231,7 +234,10 @@ public final class UDPDiscoveryService: @unchecked Sendable {
         }
 
         queue.async {
-            self.sendBroadcastData(data, routine: routine)
+            let sent = self.sendBroadcastData(data, routine: routine)
+            if sweepSubnet {
+                self.startSweep(data, skipping: Set(sent))
+            }
         }
     }
 
@@ -339,8 +345,67 @@ public final class UDPDiscoveryService: @unchecked Sendable {
         return addresses
     }
 
-    private func sendBroadcastData(_ data: Data, routine: Bool = false) {
-        guard socketFD >= 0 else { return }
+    // MARK: - Subnet Sweep
+
+    private func startSweep(_ data: Data, skipping sent: Set<String>) {
+        let targets = getLocalSubnetSweepTargets().filter { !sent.contains($0) }
+        guard !targets.isEmpty else { return }
+        sweepGeneration += 1
+        TetherLog("[UDPDiscovery] Sweeping \(targets.count) local subnet addresses")
+        continueSweep(data, targets: targets, from: 0, generation: sweepGeneration, started: Date(), pauses: 0)
+    }
+
+    /// Behind a content filter only a few dozen sends fit in the buffer while the
+    /// filter decides, so a full buffer pauses the sweep briefly instead of ending it.
+    private func continueSweep(_ data: Data, targets: [String], from start: Int, generation: Int, started: Date, pauses: Int) {
+        guard generation == sweepGeneration else { return }
+        var index = start
+        while index < targets.count, sendDatagram(data: data, toIP: targets[index], logFull: false) {
+            index += 1
+        }
+        let elapsed = Date().timeIntervalSince(started)
+        guard index < targets.count, elapsed < 5 else {
+            TetherLog("[UDPDiscovery] Sweep sent \(index) of \(targets.count) in \(String(format: "%.1f", elapsed)) s, pausing \(pauses) times for a full send buffer")
+            return
+        }
+        queue.asyncAfter(deadline: .now() + .milliseconds(50)) {
+            self.continueSweep(data, targets: targets, from: index, generation: generation, started: started, pauses: pauses + 1)
+        }
+    }
+
+    /// Every host address on each local broadcast subnet up to /22, except our own.
+    private func getLocalSubnetSweepTargets() -> [String] {
+        var targets: [String] = []
+        var seen = Set<UInt32>()
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return [] }
+        defer { freeifaddrs(ifaddr) }
+
+        for ptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
+            let flags = Int32(ptr.pointee.ifa_flags)
+            guard (flags & IFF_UP) != 0, (flags & IFF_RUNNING) != 0,
+                  (flags & IFF_LOOPBACK) == 0, (flags & IFF_BROADCAST) != 0,
+                  let addr = ptr.pointee.ifa_addr, addr.pointee.sa_family == sa_family_t(AF_INET),
+                  let netmask = ptr.pointee.ifa_netmask else { continue }
+
+            let own = UInt32(bigEndian: addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr.s_addr })
+            let mask = UInt32(bigEndian: netmask.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr.s_addr })
+            let hostBits = ~mask
+            guard hostBits >= 3, hostBits <= 1023 else { continue }
+
+            let network = own & mask
+            for host in 1..<hostBits {
+                let address = network | host
+                guard address != own, seen.insert(address).inserted else { continue }
+                targets.append("\(address >> 24).\(address >> 16 & 255).\(address >> 8 & 255).\(address & 255)")
+            }
+        }
+        return targets
+    }
+
+    @discardableResult
+    private func sendBroadcastData(_ data: Data, routine: Bool = false) -> [String] {
+        guard socketFD >= 0 else { return [] }
         let connected = delegate?.connectedHosts() ?? []
 
         // 1. Known past & manual target IPs and tailnet phones, first in case the round is cut short.
@@ -362,7 +427,7 @@ public final class UDPDiscoveryService: @unchecked Sendable {
         if routine {
             targets.removeAll { belongsToConnectedDevice($0, connectedHosts: connected) }
         }
-        guard !targets.isEmpty else { return }
+        guard !targets.isEmpty else { return [] }
 
         if Set(targets) != lastLoggedBroadcastTargets {
             lastLoggedBroadcastTargets = Set(targets)
@@ -372,11 +437,12 @@ public final class UDPDiscoveryService: @unchecked Sendable {
         for ip in targets {
             guard sendDatagram(data: data, toIP: ip) else { break }
         }
+        return targets
     }
 
     /// Returns false when the send buffer is full, so a round can stop early.
     @discardableResult
-    private func sendDatagram(data: Data, toIP ip: String) -> Bool {
+    private func sendDatagram(data: Data, toIP ip: String, logFull: Bool = true) -> Bool {
         guard socketFD >= 0 else { return false }
         var targetAddr = sockaddr_in()
         targetAddr.sin_family = sa_family_t(AF_INET)
@@ -397,7 +463,9 @@ public final class UDPDiscoveryService: @unchecked Sendable {
         }
         guard sent < 0 else { return true }
         if err == EAGAIN || err == ENOBUFS {
-            TetherLog("[UDPDiscovery] Send buffer full at \(ip) (errno \(err)); skipping the rest of this round")
+            if logFull {
+                TetherLog("[UDPDiscovery] Send buffer full at \(ip) (errno \(err)); skipping the rest of this round")
+            }
             return false
         }
         if err != EHOSTUNREACH && err != ENETUNREACH && err != EHOSTDOWN {
