@@ -38,6 +38,7 @@ public nonisolated final class MDNSDiscovery: @unchecked Sendable {
     private var watched: [String: [UInt8]] = [:]
     private var lastHeard: [String: Date] = [:]
     private var packetsHeard = 0
+    private var readvertisePending = false
     private var readBuffer = [UInt8](repeating: 0, count: 9000)
 
     public init() {}
@@ -207,7 +208,9 @@ public nonisolated final class MDNSDiscovery: @unchecked Sendable {
         startListening()
     }
 
-    /// SO_REUSEPORT lets this socket and mDNSResponder both receive multicast mDNS.
+    /// Bound to the group address, not INADDR_ANY: a socket bound to a multicast
+    /// address only receives that group's traffic, so unicast mDNS replies to this
+    /// Mac always stay with mDNSResponder, whichever socket was bound first.
     private func startListening() {
         let fd = socket(AF_INET, SOCK_DGRAM, 0)
         guard fd >= 0 else {
@@ -222,7 +225,7 @@ public nonisolated final class MDNSDiscovery: @unchecked Sendable {
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = Self.mdnsPort.bigEndian
-        addr.sin_addr.s_addr = in_addr_t(INADDR_ANY)
+        inet_pton(AF_INET, Self.mdnsGroup, &addr.sin_addr)
         let bound = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                 bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
@@ -344,8 +347,7 @@ public nonisolated final class MDNSDiscovery: @unchecked Sendable {
                                UInt16(tcpPort).bigEndian, UInt16(txt.count), raw.baseAddress, Self.registerReply, context)
         }
         guard error == kDNSServiceErr_NoError, let ref else {
-            TetherLog("[mDNS] Couldn't advertise \(Self.serviceType): error \(error); retrying in 10 s")
-            scheduleRestart()
+            advertisingFailed(error)
             return
         }
         DNSServiceSetDispatchQueue(ref, queue)
@@ -360,24 +362,29 @@ public nonisolated final class MDNSDiscovery: @unchecked Sendable {
         }
     }
 
+    // Called on `queue`, which the registration is scheduled on.
     private static let registerReply: DNSServiceRegisterReply = { _, _, errorCode, _, _, _, context in
         guard errorCode != kDNSServiceErr_NoError, let context else { return }
-        TetherLog("[mDNS] Advertising failed: error \(errorCode); restarting in 10 s")
-        Unmanaged<MDNSDiscovery>.fromOpaque(context).takeUnretainedValue().scheduleRestart()
+        Unmanaged<MDNSDiscovery>.fromOpaque(context).takeUnretainedValue().advertisingFailed(errorCode)
     }
 
-    /// After an mDNSResponder restart our registration is gone, and our socket must
-    /// rejoin after it so mDNSResponder keeps receiving unicast replies to this Mac.
-    private func scheduleRestart() {
+    /// Another device advertising our name means it has our device id, which
+    /// retrying won't fix. Anything else, such as an mDNSResponder restart,
+    /// gets one re-registration attempt at a time.
+    private func advertisingFailed(_ error: DNSServiceErrorType) {
+        stopAdvertising()
+        if error == kDNSServiceErr_NameConflict {
+            TetherLog("[mDNS] Another device is advertising our device id; not advertising")
+            return
+        }
+        TetherLog("[mDNS] Advertising failed: error \(error); retrying in 10 s")
+        guard !readvertisePending else { return }
+        readvertisePending = true
         queue.asyncAfter(deadline: .now() + 10) {
+            self.readvertisePending = false
             guard self.isRunning, let identity = self.identity else { return }
-            self.browser?.cancel()
-            self.browser = nil
-            self.stopListening()
             self.stopAdvertising()
-            self.startBrowsing()
             self.advertise(identity)
-            self.restartListening()
         }
     }
 
