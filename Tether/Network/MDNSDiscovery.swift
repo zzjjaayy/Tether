@@ -193,6 +193,7 @@ public nonisolated final class MDNSDiscovery: @unchecked Sendable {
         let monitor = NWPathMonitor()
         monitor.pathUpdateHandler = { [weak self] _ in
             guard let self, self.isRunning else { return }
+            self.readvertiseIfNeeded()
             let subnets = Self.localSubnets()
             guard subnets.map(\.address) != self.subnets.map(\.address) else { return }
             self.subnets = subnets
@@ -368,24 +369,26 @@ public nonisolated final class MDNSDiscovery: @unchecked Sendable {
         Unmanaged<MDNSDiscovery>.fromOpaque(context).takeUnretainedValue().advertisingFailed(errorCode)
     }
 
-    /// Another device advertising our name means it has our device id, which
-    /// retrying won't fix. Anything else, such as an mDNSResponder restart,
-    /// gets one re-registration attempt at a time.
+    /// A name conflict usually means another device has our device id, but a second
+    /// copy of Tether or a Bonjour Sleep Proxy after wake can cause one too, so it's
+    /// retried slowly and on network changes. One retry is pending at a time.
     private func advertisingFailed(_ error: DNSServiceErrorType) {
         stopAdvertising()
-        if error == kDNSServiceErr_NameConflict {
-            TetherLog("[mDNS] Another device is advertising our device id; not advertising")
-            return
-        }
-        TetherLog("[mDNS] Advertising failed: error \(error); retrying in 10 s")
+        let isConflict = error == kDNSServiceErr_NameConflict
+        TetherLog(isConflict
+            ? "[mDNS] Another device is advertising our device id; retrying in 5 min"
+            : "[mDNS] Advertising failed: error \(error); retrying in 10 s")
         guard !readvertisePending else { return }
         readvertisePending = true
-        queue.asyncAfter(deadline: .now() + 10) {
+        queue.asyncAfter(deadline: .now() + (isConflict ? 300 : 10)) {
             self.readvertisePending = false
-            guard self.isRunning, let identity = self.identity else { return }
-            self.stopAdvertising()
-            self.advertise(identity)
+            self.readvertiseIfNeeded()
         }
+    }
+
+    private func readvertiseIfNeeded() {
+        guard isRunning, registration == nil, let identity else { return }
+        advertise(identity)
     }
 
     /// DNS TXT record data: each entry is one length byte, then `key=value`.
