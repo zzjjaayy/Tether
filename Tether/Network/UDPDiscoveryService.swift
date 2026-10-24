@@ -434,10 +434,12 @@ public final class UDPDiscoveryService: @unchecked Sendable {
             TetherLog("[UDPDiscovery] Broadcasting discovery to \(targets.joined(separator: ", "))")
         }
 
+        var sentCount = 0
         for ip in targets {
             guard sendDatagram(data: data, toIP: ip) else { break }
+            sentCount += 1
         }
-        return targets
+        return Array(targets.prefix(sentCount))
     }
 
     /// Returns false when the send buffer is full, so a round can stop early.
